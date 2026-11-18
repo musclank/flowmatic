@@ -103,12 +103,14 @@ export default function App() {
  const [savedNotice,setSavedNotice]=useState(false);
  const [testResult,setTestResult]=useState<string[]>([]);
  const [runBusy,setRunBusy]=useState(false);
+ const [runNodeStates,setRunNodeStates]=useState<Record<string,"success"|"skipped"|"failed">>({});
+ const [runEdgeStates,setRunEdgeStates]=useState<Record<string,"active"|"inactive">>({});
  const sampleTestInput={customer:{type:"new",email:"demo@example.com"},event:{source:"flowmatic-demo"},test:true};
  const [testInput,setTestInput]=useState(JSON.stringify(sampleTestInput,null,2));
  const [testInputError,setTestInputError]=useState("");
  const filteredFlows=useMemo(()=>flows.filter(f=>f.name.toLowerCase().includes(query.toLowerCase())),[flows,query]);
  const selectedNode=nodes.find(n=>n.id===selectedNodeId)??null;
- function openBuilder(flow:Flow){const saved=savedWorkflows[String(flow.id)];setBuilderFlow(flow);setNodes(saved?.nodes??initialNodes);setEdges(saved?.edges??initialEdges);setSelectedNodeId(null);setSavedNotice(false);setTestResult([]);}
+ function openBuilder(flow:Flow){const saved=savedWorkflows[String(flow.id)];setBuilderFlow(flow);setNodes(saved?.nodes??initialNodes);setEdges(saved?.edges??initialEdges);setSelectedNodeId(null);setSavedNotice(false);setTestResult([]);setRunNodeStates({});setRunEdgeStates({});}
  async function saveDraft(){
   if(!builderFlow||!session||!supabase)return;
   const payload={id:String(builderFlow.id),user_id:session.user.id,name:builderFlow.name,description:builderFlow.description,status:builderFlow.status,runs:builderFlow.runs,nodes,edges,updated_at:new Date().toISOString()};
@@ -140,7 +142,7 @@ export default function App() {
    setTestResult(["Input validation failed. Fix the JSON data before running the workflow.","No execution was started."]);
    return;
   }
-  setRunBusy(true);setTestResult(["Validating workflow…"]);
+  setRunBusy(true);setRunNodeStates({});setRunEdgeStates({});setTestResult(["Validating workflow…"]);
   const runId=crypto.randomUUID();
   const incoming=new Set(edges.map(edge=>edge.target));
   const roots=nodes.filter(node=>node.data.kind==="trigger"&&!incoming.has(node.id));
@@ -172,6 +174,7 @@ export default function App() {
   type PendingStep={id:string;input:Record<string,unknown>};
   const queue:PendingStep[]=[{id:roots[0].id,input:triggerData}];
   const executed=new Set<string>();
+  const traversedEdgeIds=new Set<string>();
   let failed=false;
   const getPath=(value:unknown,path:string):unknown=>path.split(".").reduce<unknown>((current,key)=>current&&typeof current==="object"&&key in current?(current as Record<string,unknown>)[key]:undefined,value);
   const evaluateCondition=(config:string,input:Record<string,unknown>)=>{
@@ -221,18 +224,38 @@ export default function App() {
    if(failed){lines.push(`${executed.size}. ${node.data.label} — ${stepNote}`);setTestResult([...lines]);break;}
    const {error:updateError}=await supabase.from("workflow_run_steps").update({status:"success",output,finished_at:new Date().toISOString()}).eq("id",stepId);
    if(updateError){failed=true;lines.push(`${executed.size}. ${node.data.label} — FAILED: ${updateError.message}`);break;}
+   setRunNodeStates(current=>({...current,[node.id]:"success"}));
    lines.push(`${executed.size}. ${node.data.label} — SUCCESS · ${node.data.kind==="condition"?"evaluated":node.data.kind==="trigger"?"received input":"simulated"}${stepNote}`);
    setTestResult([...lines]);
-   nextEdges.forEach(edge=>{if(!executed.has(edge.target)&&!queue.some(item=>item.id===edge.target))queue.push({id:edge.target,input:output});});
+   nextEdges.forEach(edge=>{
+    traversedEdgeIds.add(edge.id);
+    if(!executed.has(edge.target)&&!queue.some(item=>item.id===edge.target))queue.push({id:edge.target,input:output});
+   });
+   setRunEdgeStates(current=>({...current,...Object.fromEntries(nextEdges.map(edge=>[edge.id,"active" as const]))}));
   }
+  const skippedNodes=failed?[]:nodes.filter(node=>reachable.has(node.id)&&!executed.has(node.id));
+  for(let index=0;index<skippedNodes.length;index++){
+   const node=skippedNodes[index];
+   const {error:skipError}=await supabase.from("workflow_run_steps").insert({
+    id:crypto.randomUUID(),run_id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,
+    node_id:node.id,node_name:node.data.label,node_type:node.data.kind,position:executed.size+index+1,
+    status:"skipped",input:null,output:null,error:"Skipped: this step was not on the selected execution path.",
+    started_at:null,finished_at:null
+   });
+   if(skipError)lines.push(`Could not record skipped step ${node.data.label}: ${skipError.message}`);
+   setRunNodeStates(current=>({...current,[node.id]:"skipped"}));
+  }
+  setRunEdgeStates(current=>({...current,...Object.fromEntries(edges.filter(edge=>!traversedEdgeIds.has(edge.id)).map(edge=>[edge.id,"inactive" as const]))}));
   const finalStatus=failed?"failed":"success";
   const summary=failed?"Execution stopped because a step failed.":`Simulation completed. ${executed.size} step(s) executed; condition branches were evaluated and step data was recorded.`;
   const {error:finishError}=await supabase.from("workflow_runs").update({status:finalStatus,finished_at:new Date().toISOString(),summary}).eq("id",runId);
   if(finishError){lines.push(`Could not finalize run status: ${finishError.message}`);failed=true;}
-  lines.push(failed?"Execution failed. Inspect the failed step in Execution History.":"Execution completed successfully in safe simulation mode.");
-  lines.push("Input/output data was recorded for each executed step. No email, webhook, or external service was called.");
+  lines.push(failed?"Execution failed. Inspect the failed step in Execution History.":`Execution completed successfully. ${executed.size} step(s) executed; ${skippedNodes.length} step(s) skipped.`);
+  lines.push("Green nodes/links were executed; muted nodes/links were not selected. No external service was called.");
   setTestResult(lines);setRunBusy(false);
  }
+ const displayNodes=nodes.map(node=>({...node,style:{...node.style, ...(runNodeStates[node.id]==="success"?{outline:"2px solid #2dd4bf"}:runNodeStates[node.id]==="skipped"?{opacity:0.42}:runNodeStates[node.id]==="failed"?{outline:"2px solid #fb7185"}:{})}}));
+ const displayEdges=edges.map(edge=>({...edge,style:{...edge.style, ...(runEdgeStates[edge.id]==="active"?{stroke:"#2dd4bf",strokeWidth:3}:runEdgeStates[edge.id]==="inactive"?{stroke:"#475569",strokeWidth:1,opacity:0.3}:{})}}));
  const sidebar=<aside className="flex h-full w-64 shrink-0 flex-col border-r border-white/[.07] bg-[#0a101d]">
   <a href="/" className="flex h-[76px] items-center gap-3 border-b border-white/[.07] px-6"><span className="grid h-9 w-9 place-items-center rounded-xl border border-teal-300/20 bg-teal-300/10 text-teal-300"><Workflow size={20}/></span><span className="text-[15px] font-bold tracking-[.17em]">FLOWMATIC</span></a>
   <div className="px-4 py-5"><button className="flex w-full items-center justify-between rounded-xl border border-white/[.08] bg-white/[.035] px-3 py-2.5 text-left"><span className="flex items-center gap-2.5"><span className="grid h-8 w-8 place-items-center rounded-lg bg-indigo-400/15 text-xs font-bold text-indigo-200">M</span><span><span className="block text-xs font-semibold">My workspace</span><span className="mt-0.5 block text-[10px] text-slate-500">Free plan</span></span></span><ChevronDown size={15} className="text-slate-500"/></button></div>
@@ -258,7 +281,7 @@ export default function App() {
     {testResult.length>0&&<div className="border-b border-sky-300/15 bg-sky-300/[.045] px-5 py-3 sm:px-7"><div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-bold tracking-[.14em] text-sky-200">TEST PREVIEW</span><button onClick={()=>setTestResult([])} className="text-[10px] text-slate-500 hover:text-white">Clear</button></div><ol className="space-y-1.5">{testResult.map((line,index)=><li key={index} className="text-[10px] leading-5 text-slate-300">{line}</li>)}</ol></div>}
     <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
      <aside className="order-2 w-full shrink-0 border-t border-white/[.07] bg-[#0a101d] lg:order-1 lg:w-52 lg:border-r lg:border-t-0"><div className="border-b border-white/[.06] px-4 py-4"><div className="text-[10px] font-bold tracking-[.15em] text-slate-400">ADD A STEP</div><p className="mt-1 text-[10px] text-slate-600">Choose a node type</p></div><div className="grid grid-cols-3 gap-2 p-3 lg:grid-cols-1">{([{kind:"trigger",label:"Trigger",desc:"Start your flow",Icon:Webhook},{kind:"action",label:"Action",desc:"Perform a task",Icon:Zap},{kind:"condition",label:"Condition",desc:"Branch your logic",Icon:GitBranch}] as const).map(item=><button key={item.kind} onClick={()=>addStep(item.kind)} className="flex items-center gap-3 rounded-xl border border-white/[.07] p-2.5 text-left hover:border-teal-300/30 hover:bg-white/[.035]"><span className="grid h-8 w-8 place-items-center rounded-lg bg-white/[.05] text-teal-300"><item.Icon size={16}/></span><span><span className="block text-[11px] font-semibold">{item.label}</span><span className="hidden text-[9px] text-slate-500 lg:block">{item.desc}</span></span><Plus size={13} className="ml-auto hidden text-slate-500 lg:block"/></button>)}</div><div className="mt-auto hidden border-t border-white/[.06] p-4 text-[10px] leading-5 text-slate-600 lg:block">Drag nodes to arrange your flow. Connect handles to define execution order.</div></aside>
-     <div className="relative order-1 min-h-[420px] flex-1 bg-[#080e19] lg:order-2"><div className="absolute left-4 top-4 z-10 rounded-lg border border-white/[.08] bg-[#101827]/90 px-3 py-2 text-[10px] text-slate-400">CANVAS <span className="ml-2 text-slate-600">{nodes.length} nodes · {edges.length} connections</span></div><ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={(connection:Connection)=>setEdges(current=>addEdge({...connection,animated:true,style:{stroke:"#5eead4",strokeWidth:2}},current))} onNodeClick={(_,node)=>setSelectedNodeId(node.id)} onPaneClick={()=>setSelectedNodeId(null)} nodeTypes={nodeTypes} fitView minZoom={0.25} maxZoom={1.5}><Background color="#243247" gap={22} size={1}/><MiniMap nodeColor={node=>node.data.kind==="trigger"?"#38bdf8":node.data.kind==="condition"?"#a78bfa":"#5eead4"} maskColor="rgba(3,8,18,.7)" className="!border !border-white/10 !bg-[#111a29]"/><Controls className="!overflow-hidden !rounded-lg !border !border-white/10 !bg-[#111a29] [&>button]:!border-white/10 [&>button]:!bg-[#111a29]"/></ReactFlow></div>
+     <div className="relative order-1 min-h-[420px] flex-1 bg-[#080e19] lg:order-2"><div className="absolute left-4 top-4 z-10 rounded-lg border border-white/[.08] bg-[#101827]/90 px-3 py-2 text-[10px] text-slate-400">CANVAS <span className="ml-2 text-slate-600">{nodes.length} nodes · {edges.length} connections</span></div><ReactFlow nodes={displayNodes} edges={displayEdges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={(connection:Connection)=>setEdges(current=>addEdge({...connection,animated:true,style:{stroke:"#5eead4",strokeWidth:2}},current))} onNodeClick={(_,node)=>setSelectedNodeId(node.id)} onPaneClick={()=>setSelectedNodeId(null)} nodeTypes={nodeTypes} fitView minZoom={0.25} maxZoom={1.5}><Background color="#243247" gap={22} size={1}/><MiniMap nodeColor={node=>node.data.kind==="trigger"?"#38bdf8":node.data.kind==="condition"?"#a78bfa":"#5eead4"} maskColor="rgba(3,8,18,.7)" className="!border !border-white/10 !bg-[#111a29]"/><Controls className="!overflow-hidden !rounded-lg !border !border-white/10 !bg-[#111a29] [&>button]:!border-white/10 [&>button]:!bg-[#111a29]"/></ReactFlow></div>
      <aside className="order-3 w-full shrink-0 border-t border-white/[.07] bg-[#0a101d] lg:w-64 lg:border-l lg:border-t-0"><div className="border-b border-white/[.06] px-4 py-4"><div className="text-[10px] font-bold tracking-[.15em] text-slate-400">PROPERTIES</div><p className="mt-1 text-[10px] text-slate-600">Configure selected step</p></div>{selectedNode?<div className="space-y-4 p-4"><div className="flex items-center gap-2"><span className="rounded-md bg-teal-300/10 px-2 py-1 text-[9px] font-bold uppercase text-teal-300">{selectedNode.data.kind}</span><span className="text-[10px] text-slate-600">ID: {selectedNode.id.slice(0,12)}</span></div><label className="block text-[10px] font-medium text-slate-400">Node name<input value={selectedNode.data.label} onChange={e=>updateSelected("label",e.target.value)} className="mt-2 w-full rounded-lg border border-white/10 bg-[#080e19] px-3 py-2.5 text-xs text-slate-200 outline-none focus:border-teal-300/40"/></label><label className="block text-[10px] font-medium text-slate-400">Configuration<textarea value={selectedNode.data.config} onChange={e=>updateSelected("config",e.target.value)} rows={5} className="mt-2 w-full resize-y rounded-lg border border-white/10 bg-[#080e19] px-3 py-2.5 text-[11px] leading-5 text-slate-300 outline-none focus:border-teal-300/40"/></label><button onClick={removeSelected} className="flex w-full items-center justify-center gap-2 rounded-lg border border-rose-400/20 px-3 py-2.5 text-[10px] text-rose-300"><Trash2 size={13}/> Delete node</button></div>:<div className="p-5 text-center"><span className="mx-auto grid h-10 w-10 place-items-center rounded-xl bg-white/[.04] text-slate-500"><Settings2 size={18}/></span><p className="mt-3 text-[11px] font-medium text-slate-400">Nothing selected</p><p className="mt-1 text-[10px] leading-5 text-slate-600">Select a node on the canvas to edit its properties.</p></div>}</aside>
     </div>
    </section>:<div className="mx-auto w-full max-w-[1440px] px-5 py-7 sm:px-8 sm:py-9">
