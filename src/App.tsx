@@ -144,7 +144,7 @@ export default function App() {
     branchNote=`Condition evaluated with demo input (customer.type = new): ${yes?"YES":"NO"}.`;
     next=next.filter(edge=>edge.sourceHandle===(yes?"yes":"no"));
    }
-   next.forEach(edge=>{if(visited.has(edge.target))cycle=true;else queue.push(edge.target);});
+   next.forEach(edge=>{if(visited.has(edge.target))cycle=true;else if(!queue.includes(edge.target))queue.push(edge.target);});
   }
   const disconnected=nodes.filter(node=>!visited.has(node.id));
   if(cycle||disconnected.length){
