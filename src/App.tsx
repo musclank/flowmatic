@@ -239,7 +239,7 @@ export default function App() {
    const {error:skipError}=await supabase.from("workflow_run_steps").insert({
     id:crypto.randomUUID(),run_id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,
     node_id:node.id,node_name:node.data.label,node_type:node.data.kind,position:executed.size+index+1,
-    status:"skipped",input:null,output:null,error:"Skipped: this step was not on the selected execution path.",
+    status:"skipped",input:{},output:{skipped:true,reason:"This step was not on the selected execution path."},error:"Skipped: this step was not on the selected execution path.",
     started_at:null,finished_at:null
    });
    if(skipError)lines.push(`Could not record skipped step ${node.data.label}: ${skipError.message}`);
