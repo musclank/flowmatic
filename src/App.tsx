@@ -140,7 +140,7 @@ export default function App() {
    visited.add(id);ordered.push(node);
    let next=edges.filter(edge=>edge.source===id);
    if(node.data.kind==="condition"){
-    const yes=/equals\\s+new|customer\\.type.*new/i.test(node.data.config);
+    const yes=/equals\s+new|customer\.type.*new/i.test(node.data.config);
     branchNote=`Condition evaluated with demo input (customer.type = new): ${yes?"YES":"NO"}.`;
     next=next.filter(edge=>edge.sourceHandle===(yes?"yes":"no"));
    }
