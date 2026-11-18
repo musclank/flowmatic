@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import type { Session } from "@supabase/supabase-js";
+import AuthScreen from "./AuthScreen";
+import { supabase } from "./lib/supabase";
 import { addEdge, Background, Controls, Handle, MiniMap, Position, ReactFlow, useEdgesState, useNodesState, type Connection, type Edge, type Node, type NodeProps } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Activity, ArrowLeft, ArrowUpRight, Bell, Blocks, CheckCircle2, ChevronDown, CircleHelp, Command, Filter, GitBranch, LayoutDashboard, Mail, Menu, MoreHorizontal, Plus, Play, Search, Settings2, Workflow, Zap, X, Webhook, MessageSquare, Save, Trash2 } from "lucide-react";
@@ -70,7 +73,15 @@ function LandingPage() {
 }
 
 export default function App() {
- const [flows,setFlows]=useState<Flow[]>(()=>{try{const stored=localStorage.getItem("flowmatic:flows");return stored?JSON.parse(stored) as Flow[]:initialFlows;}catch{return initialFlows;}});
+ const [session,setSession]=useState<Session|null>(null);
+ const [authReady,setAuthReady]=useState(false);
+ useEffect(()=>{
+  if(!supabase){setAuthReady(true);return;}
+  supabase.auth.getSession().then(({data})=>{setSession(data.session);setAuthReady(true);});
+  const {data:{subscription}}=supabase.auth.onAuthStateChange((_event,nextSession)=>setSession(nextSession));
+  return ()=>subscription.unsubscribe();
+ },[]);
+ const [flows,setFlows]=useState<Flow[]>([]);
  const [activeNav,setActiveNav]=useState("Overview");
  const [query,setQuery]=useState("");
  const [showCreate,setShowCreate]=useState(false);
@@ -79,16 +90,40 @@ export default function App() {
  const [builderFlow,setBuilderFlow]=useState<Flow|null>(null);
  const [nodes,setNodes,onNodesChange]=useNodesState<FlowNode>(initialNodes);
  const [edges,setEdges,onEdgesChange]=useEdgesState<Edge>(initialEdges);
- const [savedWorkflows,setSavedWorkflows]=useState<Record<string,{nodes:FlowNode[];edges:Edge[]}>>(()=>{try{return JSON.parse(localStorage.getItem("flowmatic:workflows")??"{}") as Record<string,{nodes:FlowNode[];edges:Edge[]}>;}catch{return {};}});
- useEffect(()=>{try{localStorage.setItem("flowmatic:flows",JSON.stringify(flows));}catch{}},[flows]);
- useEffect(()=>{try{localStorage.setItem("flowmatic:workflows",JSON.stringify(savedWorkflows));}catch{}},[savedWorkflows]);
+ const [savedWorkflows,setSavedWorkflows]=useState<Record<string,{nodes:FlowNode[];edges:Edge[]}>>({});
+ useEffect(()=>{
+  if(!session||!supabase)return;
+  let cancelled=false;
+  (async()=>{
+   const {data,error}=await supabase.from("workflows").select("*").order("updated_at",{ascending:false});
+   if(cancelled)return;
+   if(error){console.error("Could not load workflows",error);return;}
+   const rows=data??[];
+   setFlows(rows.map(row=>({id:Number(row.id),name:row.name,description:row.description??"",status:row.status,runs:row.runs??"0",updated:new Date(row.updated_at).toLocaleString(),icon:"webhook" as const})));
+   setSavedWorkflows(Object.fromEntries(rows.map(row=>[String(row.id),{nodes:(row.nodes??[]) as FlowNode[],edges:(row.edges??[]) as Edge[]}])));
+  })();
+  return ()=>{cancelled=true;};
+ },[session?.user.id]);
  const [selectedNodeId,setSelectedNodeId]=useState<string|null>(null);
  const [savedNotice,setSavedNotice]=useState(false);
  const filteredFlows=useMemo(()=>flows.filter(f=>f.name.toLowerCase().includes(query.toLowerCase())),[flows,query]);
  const selectedNode=nodes.find(n=>n.id===selectedNodeId)??null;
  function openBuilder(flow:Flow){const saved=savedWorkflows[String(flow.id)];setBuilderFlow(flow);setNodes(saved?.nodes??initialNodes);setEdges(saved?.edges??initialEdges);setSelectedNodeId(null);setSavedNotice(false);}
- function saveDraft(){if(!builderFlow)return;setSavedWorkflows(current=>({...current,[String(builderFlow.id)]:{nodes,edges}}));setSavedNotice(true);}
- function createFlow(){const name=newName.trim();if(!name)return;const flow:Flow={id:Date.now(),name,description:"Start building your automation",status:"Draft",runs:"0",updated:"Just now",icon:"webhook"};setFlows(current=>[flow,...current]);setNewName("");setShowCreate(false);setActiveNav("Workflows");openBuilder(flow);}
+ async function saveDraft(){
+  if(!builderFlow||!session||!supabase)return;
+  const payload={id:String(builderFlow.id),user_id:session.user.id,name:builderFlow.name,description:builderFlow.description,status:builderFlow.status,runs:builderFlow.runs,nodes,edges,updated_at:new Date().toISOString()};
+  const {error}=await supabase.from("workflows").upsert(payload,{onConflict:"id"});
+  if(error){console.error(error);window.alert("Could not save workflow: "+error.message);return;}
+  setSavedWorkflows(current=>({...current,[String(builderFlow.id)]:{nodes,edges}}));
+  setSavedNotice(true);
+ }
+ async function createFlow(){
+  const name=newName.trim();if(!name||!session||!supabase)return;
+  const flow:Flow={id:Date.now(),name,description:"Start building your automation",status:"Draft",runs:"0",updated:"Just now",icon:"webhook"};
+  const {error}=await supabase.from("workflows").insert({id:String(flow.id),user_id:session.user.id,name:flow.name,description:flow.description,status:flow.status,runs:flow.runs,nodes:initialNodes,edges:initialEdges});
+  if(error){window.alert("Could not create workflow: "+error.message);return;}
+  setFlows(current=>[flow,...current]);setSavedWorkflows(current=>({...current,[String(flow.id)]:{nodes:initialNodes,edges:initialEdges}}));setNewName("");setShowCreate(false);setActiveNav("Workflows");openBuilder(flow);
+ }
  function addStep(kind:StepKind){const count=nodes.filter(n=>n.data.kind===kind).length+1;const id=`${kind}-${Date.now()}`;const defaults=kind==="trigger"?{label:"Webhook trigger",subtitle:"Receive an incoming event",config:"Listen for an incoming HTTP request."}:kind==="condition"?{label:"Condition",subtitle:"IF / ELSE logic",config:"Set the condition that decides which path to follow."}:{label:"New action",subtitle:"Configure an action",config:"Choose an app and configure the action."};const newNode:FlowNode={id,type:"flowStep",position:{x:430+(count%2)*30,y:100+nodes.length*35},data:{...defaults,kind}};setNodes(current=>[...current,newNode]);setSelectedNodeId(id);}
  function updateSelected(field:"label"|"config",value:string){if(!selectedNodeId)return;setNodes(current=>current.map(n=>n.id===selectedNodeId?{...n,data:{...n.data,[field]:value}}:n));}
  function removeSelected(){if(!selectedNodeId)return;setNodes(current=>current.filter(n=>n.id!==selectedNodeId));setEdges(current=>current.filter(e=>e.source!==selectedNodeId&&e.target!==selectedNodeId));setSelectedNodeId(null);}
@@ -100,10 +135,12 @@ export default function App() {
   <div className="flex items-center gap-3 border-t border-white/[.07] px-5 py-4"><span className="grid h-8 w-8 place-items-center rounded-full bg-slate-700 text-xs font-semibold">M</span><span className="min-w-0 flex-1"><span className="block text-xs font-medium">My account</span><span className="block text-[10px] text-slate-500">Free workspace</span></span><MoreHorizontal size={17} className="text-slate-500"/></div>
  </aside>;
  if (window.location.pathname !== "/dashboard" && !window.location.pathname.startsWith("/builder/") && window.location.pathname !== "/workflows") return <LandingPage/>;
+ if(!authReady)return <div className="flex min-h-screen items-center justify-center bg-[#080d17] text-sm text-slate-400">Loading your workspace...</div>;
+ if(!session||!supabase)return <AuthScreen/>;
  return <div className="min-h-screen bg-[#080d17] text-slate-100"><div className="flex min-h-screen">
   <div className="hidden lg:block">{sidebar}</div>{mobileNav&&<div className="fixed inset-0 z-40 flex lg:hidden"><button aria-label="Close navigation" className="absolute inset-0 bg-black/70" onClick={()=>setMobileNav(false)}/><div className="relative z-10">{sidebar}</div></div>}
   <main className="flex min-w-0 flex-1 flex-col">
-   <header className="flex h-[76px] shrink-0 items-center justify-between border-b border-white/[.07] px-5 sm:px-8"><div className="flex items-center gap-3"><button onClick={()=>setMobileNav(true)} className="rounded-lg p-2 text-slate-400 lg:hidden" aria-label="Open navigation"><Menu size={20}/></button><div><div className="text-[11px] text-slate-500">Workspace / <span className="text-slate-300">{builderFlow?"Builder":activeNav}</span></div><div className="mt-0.5 text-sm font-semibold">{builderFlow?builderFlow.name:activeNav}</div></div></div><div className="flex items-center gap-2 sm:gap-4"><button className="hidden items-center gap-2 rounded-lg border border-white/[.08] bg-white/[.025] px-3 py-2 text-[11px] text-slate-500 sm:flex"><Command size={13}/> Search <kbd className="ml-3 rounded border border-white/10 px-1.5 py-0.5 text-[9px]">⌘ K</kbd></button><button className="relative rounded-lg p-2 text-slate-400" aria-label="Notifications"><Bell size={18}/><span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-teal-300"/></button><span className="grid h-8 w-8 place-items-center rounded-full border border-white/10 bg-indigo-400/15 text-xs font-semibold text-indigo-200">M</span></div></header>
+   <header className="flex h-[76px] shrink-0 items-center justify-between border-b border-white/[.07] px-5 sm:px-8"><div className="flex items-center gap-3"><button onClick={()=>setMobileNav(true)} className="rounded-lg p-2 text-slate-400 lg:hidden" aria-label="Open navigation"><Menu size={20}/></button><div><div className="text-[11px] text-slate-500">Workspace / <span className="text-slate-300">{builderFlow?"Builder":activeNav}</span></div><div className="mt-0.5 text-sm font-semibold">{builderFlow?builderFlow.name:activeNav}</div></div></div><div className="flex items-center gap-2 sm:gap-4"><button className="hidden items-center gap-2 rounded-lg border border-white/[.08] bg-white/[.025] px-3 py-2 text-[11px] text-slate-500 sm:flex"><Command size={13}/> Search <kbd className="ml-3 rounded border border-white/10 px-1.5 py-0.5 text-[9px]">⌘ K</kbd></button><button className="relative rounded-lg p-2 text-slate-400" aria-label="Notifications"><Bell size={18}/><span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-teal-300"/></button><button onClick={()=>supabase?.auth.signOut()} className="rounded-lg border border-white/10 px-3 py-2 text-[10px] text-slate-400 hover:text-white">Sign out</button><span className="hidden sm:grid h-8 w-8 place-items-center rounded-full border border-white/10 bg-indigo-400/15 text-xs font-semibold text-indigo-200">{session.user.email?.slice(0,1).toUpperCase()??"U"}</span></div></header>
    {builderFlow?<section className="flex min-h-0 flex-1 flex-col">
     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[.07] px-5 py-3 sm:px-7"><div className="flex items-center gap-3"><button onClick={()=>setBuilderFlow(null)} className="rounded-lg border border-white/10 p-2 text-slate-400" aria-label="Back to workflows"><ArrowLeft size={16}/></button><div><div className="text-xs font-semibold">{builderFlow.name}</div><div className="mt-1 text-[10px] text-slate-500">Visual editor · Draft</div></div></div><div className="flex items-center gap-2"><span className="hidden text-[10px] text-slate-500 sm:block">Saved in this browser</span><button onClick={saveDraft} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-[11px] text-slate-300"><Save size={14}/> Save draft</button><button onClick={()=>setSavedNotice(true)} className="inline-flex items-center gap-2 rounded-lg bg-teal-300 px-3 py-2 text-[11px] font-bold text-slate-950"><Play size={13}/> Test workflow</button></div></div>
     {savedNotice&&<div className="border-b border-teal-300/15 bg-teal-300/[.06] px-6 py-2 text-[11px] text-teal-200">Workflow saved in this browser. Your nodes and connections will be restored when you reopen this workflow on this device.</div>}
