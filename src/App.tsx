@@ -175,6 +175,7 @@ export default function App() {
   const queue:PendingStep[]=[{id:roots[0].id,input:triggerData}];
   const executed=new Set<string>();
   const queued=new Set<string>([roots[0].id]);
+  const settled=new Set<string>();
   const traversedEdgeIds=new Set<string>();
   const resolvedEdgeIds=new Set<string>();
   const activeIncoming=new Map<string,Edge[]>();
@@ -259,7 +260,7 @@ export default function App() {
    while(discovered){
     discovered=false;
     for(const candidate of nodes){
-     if(candidate.id===roots[0].id||executed.has(candidate.id)||queued.has(candidate.id))continue;
+     if(candidate.id===roots[0].id||executed.has(candidate.id)||queued.has(candidate.id)||settled.has(candidate.id))continue;
      const incomingEdges=edges.filter(edge=>edge.target===candidate.id);
      if(!incomingEdges.length||!incomingEdges.every(edge=>resolvedEdgeIds.has(edge.id)))continue;
      const activeEdges=activeIncoming.get(candidate.id)??[];
@@ -268,6 +269,7 @@ export default function App() {
       queue.push({id:candidate.id,input:mergeData(inputs)});
       queued.add(candidate.id);
      }else{
+      settled.add(candidate.id);
       (adjacency.get(candidate.id)??[]).forEach(edge=>{
        resolvedEdgeIds.add(edge.id);
        setRunEdgeStates(current=>({...current,[edge.id]:"inactive"}));
