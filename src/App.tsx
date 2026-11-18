@@ -103,6 +103,9 @@ export default function App() {
  const [savedNotice,setSavedNotice]=useState(false);
  const [testResult,setTestResult]=useState<string[]>([]);
  const [runBusy,setRunBusy]=useState(false);
+ const sampleTestInput={customer:{type:"new",email:"demo@example.com"},event:{source:"flowmatic-demo"},test:true};
+ const [testInput,setTestInput]=useState(JSON.stringify(sampleTestInput,null,2));
+ const [testInputError,setTestInputError]=useState("");
  const filteredFlows=useMemo(()=>flows.filter(f=>f.name.toLowerCase().includes(query.toLowerCase())),[flows,query]);
  const selectedNode=nodes.find(n=>n.id===selectedNodeId)??null;
  function openBuilder(flow:Flow){const saved=savedWorkflows[String(flow.id)];setBuilderFlow(flow);setNodes(saved?.nodes??initialNodes);setEdges(saved?.edges??initialEdges);setSelectedNodeId(null);setSavedNotice(false);setTestResult([]);}
@@ -126,6 +129,17 @@ export default function App() {
  function removeSelected(){if(!selectedNodeId)return;setNodes(current=>current.filter(n=>n.id!==selectedNodeId));setEdges(current=>current.filter(e=>e.source!==selectedNodeId&&e.target!==selectedNodeId));setSelectedNodeId(null);}
  async function runTest(){
   if(runBusy||!builderFlow||!session||!supabase)return;
+  let triggerData:Record<string,unknown>;
+  try{
+   const parsed:unknown=JSON.parse(testInput);
+   if(!parsed||typeof parsed!=="object"||Array.isArray(parsed))throw new Error("The input must be a JSON object.");
+   triggerData=parsed as Record<string,unknown>;
+   setTestInputError("");
+  }catch(error){
+   setTestInputError(error instanceof Error?error.message:"Invalid JSON input.");
+   setTestResult(["Input validation failed. Fix the JSON data before running the workflow.","No execution was started."]);
+   return;
+  }
   setRunBusy(true);setTestResult(["Validating workflow…"]);
   const runId=crypto.randomUUID();
   const incoming=new Set(edges.map(edge=>edge.target));
@@ -151,7 +165,6 @@ export default function App() {
    setTestResult([cycle?"Validation failed: a cycle was detected.":`Validation failed: ${disconnected.length} step(s) are disconnected from the trigger.`,"Connect all steps to a valid path, then run the test again.","No execution was started."]);setRunBusy(false);return;
   }
   const started=new Date().toISOString();
-  const triggerData={customer:{type:"new",email:"demo@example.com"},event:{source:"flowmatic-demo"},test:true};
   const {data:runData,error:runError}=await supabase.from("workflow_runs").insert({id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,status:"running",started_at:started,trigger_data:triggerData,summary:"Safe simulation with data mapping and conditional routing; no external services called."}).select("id").single();
   if(runError){setTestResult([`Could not save execution: ${runError.message}`,"Run supabase/migrations/20261118_execution_engine_v1.sql in Supabase SQL Editor, then retry."]);setRunBusy(false);return;}
   const lines=[`Execution ${runData.id.slice(0,8)} · RUNNING`];
@@ -237,6 +250,11 @@ export default function App() {
    {builderFlow?<section className="flex min-h-0 flex-1 flex-col">
     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[.07] px-5 py-3 sm:px-7"><div className="flex items-center gap-3"><button onClick={()=>setBuilderFlow(null)} className="rounded-lg border border-white/10 p-2 text-slate-400" aria-label="Back to workflows"><ArrowLeft size={16}/></button><div><div className="text-xs font-semibold">{builderFlow.name}</div><div className="mt-1 text-[10px] text-slate-500">Visual editor · Draft</div></div></div><div className="flex items-center gap-2"><span className="hidden text-[10px] text-slate-500 sm:block">Cloud sync enabled</span><button onClick={saveDraft} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-[11px] text-slate-300"><Save size={14}/> Save draft</button><button onClick={runTest} disabled={runBusy} className="inline-flex items-center gap-2 rounded-lg bg-teal-300 px-3 py-2 text-[11px] font-bold text-slate-950 disabled:opacity-50"><Play size={13}/> {runBusy?"Running…":"Run test"}</button></div></div>
     {savedNotice&&<div className="border-b border-teal-300/15 bg-teal-300/[.06] px-6 py-2 text-[11px] text-teal-200">Workflow saved to your Supabase cloud workspace.</div>}
+    <div className="border-b border-white/[.07] bg-[#0b1422] px-5 py-4 sm:px-7">
+     <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><div><div className="text-[10px] font-bold tracking-[.14em] text-slate-300">CUSTOM TEST INPUT</div><p className="mt-1 text-[10px] text-slate-500">Provide a JSON object that will enter the workflow through its trigger.</p></div><button onClick={()=>{setTestInput(JSON.stringify(sampleTestInput,null,2));setTestInputError("");}} className="rounded-lg border border-white/10 px-3 py-1.5 text-[10px] text-slate-400 hover:text-white">Reset sample</button></div>
+     <textarea aria-label="Custom test input JSON" value={testInput} onChange={e=>{setTestInput(e.target.value);setTestInputError("");}} rows={6} spellCheck={false} className="w-full resize-y rounded-xl border border-white/10 bg-[#070d17] px-3 py-3 font-mono text-[11px] leading-5 text-teal-100 outline-none focus:border-teal-300/40"/>
+     {testInputError&&<p className="mt-2 text-[10px] text-rose-300">Invalid input: {testInputError}</p>}
+    </div>
     {testResult.length>0&&<div className="border-b border-sky-300/15 bg-sky-300/[.045] px-5 py-3 sm:px-7"><div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-bold tracking-[.14em] text-sky-200">TEST PREVIEW</span><button onClick={()=>setTestResult([])} className="text-[10px] text-slate-500 hover:text-white">Clear</button></div><ol className="space-y-1.5">{testResult.map((line,index)=><li key={index} className="text-[10px] leading-5 text-slate-300">{line}</li>)}</ol></div>}
     <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
      <aside className="order-2 w-full shrink-0 border-t border-white/[.07] bg-[#0a101d] lg:order-1 lg:w-52 lg:border-r lg:border-t-0"><div className="border-b border-white/[.06] px-4 py-4"><div className="text-[10px] font-bold tracking-[.15em] text-slate-400">ADD A STEP</div><p className="mt-1 text-[10px] text-slate-600">Choose a node type</p></div><div className="grid grid-cols-3 gap-2 p-3 lg:grid-cols-1">{([{kind:"trigger",label:"Trigger",desc:"Start your flow",Icon:Webhook},{kind:"action",label:"Action",desc:"Perform a task",Icon:Zap},{kind:"condition",label:"Condition",desc:"Branch your logic",Icon:GitBranch}] as const).map(item=><button key={item.kind} onClick={()=>addStep(item.kind)} className="flex items-center gap-3 rounded-xl border border-white/[.07] p-2.5 text-left hover:border-teal-300/30 hover:bg-white/[.035]"><span className="grid h-8 w-8 place-items-center rounded-lg bg-white/[.05] text-teal-300"><item.Icon size={16}/></span><span><span className="block text-[11px] font-semibold">{item.label}</span><span className="hidden text-[9px] text-slate-500 lg:block">{item.desc}</span></span><Plus size={13} className="ml-auto hidden text-slate-500 lg:block"/></button>)}</div><div className="mt-auto hidden border-t border-white/[.06] p-4 text-[10px] leading-5 text-slate-600 lg:block">Drag nodes to arrange your flow. Connect handles to define execution order.</div></aside>
