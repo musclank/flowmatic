@@ -134,40 +134,91 @@ export default function App() {
   if(nodes.length===0||roots.length!==1||invalidEdges.length){
    setTestResult([nodes.length===0?"Validation failed: add at least one step.":roots.length!==1?"Validation failed: the workflow must have exactly one unconnected trigger.":"Validation failed: a connection points to a missing step.","No execution was started."]);setRunBusy(false);return;
   }
-  const visited=new Set<string>();const ordered:FlowNode[]=[];const queue=[roots[0].id];let cycle=false;let branchNote="";
-  while(queue.length){
-   const id=queue.shift()!;if(visited.has(id)){cycle=true;continue;}
-   const node=nodes.find(item=>item.id===id);if(!node)continue;
-   visited.add(id);ordered.push(node);
-   let next=edges.filter(edge=>edge.source===id);
-   if(node.data.kind==="condition"){
-    const yes=/equals\s+new|customer\.type.*new/i.test(node.data.config);
-    branchNote=`Condition evaluated with demo input (customer.type = new): ${yes?"YES":"NO"}.`;
-    next=next.filter(edge=>edge.sourceHandle===(yes?"yes":"no"));
-   }
-   next.forEach(edge=>{if(visited.has(edge.target))cycle=true;else if(!queue.includes(edge.target))queue.push(edge.target);});
-  }
-  const disconnected=nodes.filter(node=>!visited.has(node.id));
+  const adjacency=new Map<string,Edge[]>();
+  nodes.forEach(node=>adjacency.set(node.id,edges.filter(edge=>edge.source===node.id)));
+  const reachable=new Set<string>(),visiting=new Set<string>(),visited=new Set<string>();
+  let cycle=false;
+  const inspect=(id:string)=>{
+   if(visiting.has(id)){cycle=true;return;}
+   if(visited.has(id))return;
+   visiting.add(id);reachable.add(id);
+   (adjacency.get(id)??[]).forEach(edge=>inspect(edge.target));
+   visiting.delete(id);visited.add(id);
+  };
+  inspect(roots[0].id);
+  const disconnected=nodes.filter(node=>!reachable.has(node.id));
   if(cycle||disconnected.length){
    setTestResult([cycle?"Validation failed: a cycle was detected.":`Validation failed: ${disconnected.length} step(s) are disconnected from the trigger.`,"Connect all steps to a valid path, then run the test again.","No execution was started."]);setRunBusy(false);return;
   }
   const started=new Date().toISOString();
-  const {data:runData,error:runError}=await supabase.from("workflow_runs").insert({id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,status:"running",started_at:started,trigger_data:{customer:{type:"new",email:"demo@example.com"}},summary:"Safe simulation; no external services called."}).select("id").single();
+  const triggerData={customer:{type:"new",email:"demo@example.com"},event:{source:"flowmatic-demo"},test:true};
+  const {data:runData,error:runError}=await supabase.from("workflow_runs").insert({id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,status:"running",started_at:started,trigger_data:triggerData,summary:"Safe simulation with data mapping and conditional routing; no external services called."}).select("id").single();
   if(runError){setTestResult([`Could not save execution: ${runError.message}`,"Run supabase/migrations/20261118_execution_engine_v1.sql in Supabase SQL Editor, then retry."]);setRunBusy(false);return;}
-  const lines=[`Execution ${runData.id.slice(0,8)} · RUNNING`];setTestResult(lines);
+  const lines=[`Execution ${runData.id.slice(0,8)} · RUNNING`];
+  setTestResult(lines);
+  type PendingStep={id:string;input:Record<string,unknown>};
+  const queue:PendingStep[]=[{id:roots[0].id,input:triggerData}];
+  const executed=new Set<string>();
   let failed=false;
-  for(let i=0;i<ordered.length;i++){
-   const node=ordered[i],stepId=crypto.randomUUID();
-   const {error:insertError}=await supabase.from("workflow_run_steps").insert({id:stepId,run_id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,node_id:node.id,node_name:node.data.label,node_type:node.data.kind,position:i+1,status:"running",input:{simulation:true},started_at:new Date().toISOString()});
-   if(insertError){failed=true;lines.push(`${i+1}. ${node.data.label} — FAILED: ${insertError.message}`);break;}
-   const {error:updateError}=await supabase.from("workflow_run_steps").update({status:"success",output:{simulation:true,message:"Step simulated; no external action performed."},finished_at:new Date().toISOString()}).eq("id",stepId);
-   if(updateError){failed=true;lines.push(`${i+1}. ${node.data.label} — FAILED: ${updateError.message}`);break;}
-   lines.push(`${i+1}. ${node.data.label} — SUCCESS · simulated`);setTestResult([...lines]);
+  const getPath=(value:unknown,path:string):unknown=>path.split(".").reduce<unknown>((current,key)=>current&&typeof current==="object"&&key in current?(current as Record<string,unknown>)[key]:undefined,value);
+  const evaluateCondition=(config:string,input:Record<string,unknown>)=>{
+   const match=config.match(/([a-zA-Z0-9_.]+)\s+(equals|is not|not equals|contains|greater than|less than|exists)\s*["']?([^\n."']*)/i);
+   if(!match)return {matched:false,path:"",actual:undefined,expected:undefined,operator:"unsupported"};
+   const [,path,rawOperator,rawExpected]=match;
+   const actual=getPath(input,path);
+   const operator=rawOperator.toLowerCase();
+   const expected=rawExpected.trim();
+   let matched=false;
+   if(operator==="exists")matched=actual!==undefined&&actual!==null;
+   else if(operator==="equals")matched=String(actual??"").toLowerCase()===expected.toLowerCase();
+   else if(operator==="is not"||operator==="not equals")matched=String(actual??"").toLowerCase()!==expected.toLowerCase();
+   else if(operator==="contains")matched=Array.isArray(actual)?actual.some(item=>String(item)===expected):String(actual??"").toLowerCase().includes(expected.toLowerCase());
+   else if(operator==="greater than")matched=Number(actual)>Number(expected);
+   else if(operator==="less than")matched=Number(actual)<Number(expected);
+   return {matched,path,actual,expected,operator};
+  };
+  while(queue.length&&!failed){
+   const current=queue.shift()!;
+   if(executed.has(current.id))continue;
+   executed.add(current.id);
+   const node=nodes.find(item=>item.id===current.id);
+   if(!node)continue;
+   const stepId=crypto.randomUUID(),stepStarted=new Date().toISOString();
+   let output:Record<string,unknown>={};
+   let nextEdges=adjacency.get(node.id)??[];
+   let stepNote="";
+   if(node.data.kind==="trigger"){
+    output={...current.input,trigger:{node:node.data.label,received:true}};
+   }else if(node.data.kind==="condition"){
+    const result=evaluateCondition(node.data.config,current.input);
+    if(result.operator==="unsupported"){
+     failed=true;
+     stepNote="FAILED · unsupported condition. Use: field.path equals value (or contains, is not, greater than, less than, exists).";
+    }else{
+     const selectedPath=result.matched?"yes":"no";
+     output={...current.input,condition:{field:result.path,operator:result.operator,actual:result.actual??null,expected:result.expected??null,matched:result.matched,selectedPath}};
+     nextEdges=nextEdges.filter(edge=>edge.sourceHandle===selectedPath);
+     stepNote=` · ${selectedPath.toUpperCase()} (${String(result.actual??"undefined")} ${result.operator} ${String(result.expected??"")})`;
+    }
+   }else{
+    output={...current.input,lastAction:{name:node.data.label,simulated:true,message:"Action simulated; no external service was called."}};
+   }
+   const {error:insertError}=await supabase.from("workflow_run_steps").insert({id:stepId,run_id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,node_id:node.id,node_name:node.data.label,node_type:node.data.kind,position:executed.size,status:failed?"failed":"running",input:current.input,output:failed?null:output,error:failed?stepNote:null,started_at:stepStarted,finished_at:failed?new Date().toISOString():null});
+   if(insertError){failed=true;lines.push(`${executed.size}. ${node.data.label} — FAILED: ${insertError.message}`);break;}
+   if(failed){lines.push(`${executed.size}. ${node.data.label} — ${stepNote}`);setTestResult([...lines]);break;}
+   const {error:updateError}=await supabase.from("workflow_run_steps").update({status:"success",output,finished_at:new Date().toISOString()}).eq("id",stepId);
+   if(updateError){failed=true;lines.push(`${executed.size}. ${node.data.label} — FAILED: ${updateError.message}`);break;}
+   lines.push(`${executed.size}. ${node.data.label} — SUCCESS · ${node.data.kind==="condition"?"evaluated":node.data.kind==="trigger"?"received input":"simulated"}${stepNote}`);
+   setTestResult([...lines]);
+   nextEdges.forEach(edge=>{if(!executed.has(edge.target)&&!queue.some(item=>item.id===edge.target))queue.push({id:edge.target,input:output});});
   }
-  if(branchNote)lines.push(branchNote);
-  await supabase.from("workflow_runs").update({status:failed?"failed":"success",finished_at:new Date().toISOString(),summary:failed?"Execution stopped because a step could not be saved.":"Simulation completed successfully."}).eq("id",runId);
-  lines.push(failed?"Execution failed. Check database permissions and run details.":"Execution completed successfully in safe simulation mode.");
-  lines.push("No email, webhook, or external service was called.");setTestResult(lines);setRunBusy(false);
+  const finalStatus=failed?"failed":"success";
+  const summary=failed?"Execution stopped because a step failed.":`Simulation completed. ${executed.size} step(s) executed; condition branches were evaluated and step data was recorded.`;
+  const {error:finishError}=await supabase.from("workflow_runs").update({status:finalStatus,finished_at:new Date().toISOString(),summary}).eq("id",runId);
+  if(finishError){lines.push(`Could not finalize run status: ${finishError.message}`);failed=true;}
+  lines.push(failed?"Execution failed. Inspect the failed step in Execution History.":"Execution completed successfully in safe simulation mode.");
+  lines.push("Input/output data was recorded for each executed step. No email, webhook, or external service was called.");
+  setTestResult(lines);setRunBusy(false);
  }
  const sidebar=<aside className="flex h-full w-64 shrink-0 flex-col border-r border-white/[.07] bg-[#0a101d]">
   <a href="/" className="flex h-[76px] items-center gap-3 border-b border-white/[.07] px-6"><span className="grid h-9 w-9 place-items-center rounded-xl border border-teal-300/20 bg-teal-300/10 text-teal-300"><Workflow size={20}/></span><span className="text-[15px] font-bold tracking-[.17em]">FLOWMATIC</span></a>
