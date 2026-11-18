@@ -101,6 +101,7 @@ export default function App() {
  const [selectedNodeId,setSelectedNodeId]=useState<string|null>(null);
  const [savedNotice,setSavedNotice]=useState(false);
  const [testResult,setTestResult]=useState<string[]>([]);
+ const [runBusy,setRunBusy]=useState(false);
  const filteredFlows=useMemo(()=>flows.filter(f=>f.name.toLowerCase().includes(query.toLowerCase())),[flows,query]);
  const selectedNode=nodes.find(n=>n.id===selectedNodeId)??null;
  function openBuilder(flow:Flow){const saved=savedWorkflows[String(flow.id)];setBuilderFlow(flow);setNodes(saved?.nodes??initialNodes);setEdges(saved?.edges??initialEdges);setSelectedNodeId(null);setSavedNotice(false);setTestResult([]);}
@@ -122,18 +123,50 @@ export default function App() {
  function addStep(kind:StepKind){const count=nodes.filter(n=>n.data.kind===kind).length+1;const id=`${kind}-${Date.now()}`;const defaults=kind==="trigger"?{label:"Webhook trigger",subtitle:"Receive an incoming event",config:"Listen for an incoming HTTP request."}:kind==="condition"?{label:"Condition",subtitle:"IF / ELSE logic",config:"Set the condition that decides which path to follow."}:{label:"New action",subtitle:"Configure an action",config:"Choose an app and configure the action."};const newNode:FlowNode={id,type:"flowStep",position:{x:430+(count%2)*30,y:100+nodes.length*35},data:{...defaults,kind}};setNodes(current=>[...current,newNode]);setSelectedNodeId(id);}
  function updateSelected(field:"label"|"config",value:string){if(!selectedNodeId)return;setNodes(current=>current.map(n=>n.id===selectedNodeId?{...n,data:{...n.data,[field]:value}}:n));}
  function removeSelected(){if(!selectedNodeId)return;setNodes(current=>current.filter(n=>n.id!==selectedNodeId));setEdges(current=>current.filter(e=>e.source!==selectedNodeId&&e.target!==selectedNodeId));setSelectedNodeId(null);}
- function runTest(){
-  if(nodes.length===0){setTestResult(["No steps found. Add a trigger or action before testing."]);return;}
+ async function runTest(){
+  if(runBusy||!builderFlow||!session||!supabase)return;
+  setRunBusy(true);setTestResult(["Validating workflow…"]);
+  const runId=crypto.randomUUID();
   const incoming=new Set(edges.map(edge=>edge.target));
-  const queue=nodes.filter(node=>!incoming.has(node.id)).map(node=>node.id);
-  const visited=new Set<string>();
-  const ordered:string[]=[];
-  while(queue.length){const id=queue.shift()!;if(visited.has(id))continue;visited.add(id);ordered.push(id);edges.filter(edge=>edge.source===id).forEach(edge=>{if(!visited.has(edge.target))queue.push(edge.target);});}
-  const remaining=nodes.filter(node=>!visited.has(node.id)).map(node=>node.id);
-  const lines=ordered.map((id,index)=>{const node=nodes.find(item=>item.id===id)!;return `${index+1}. ${node.data.label} — ${node.data.kind.toUpperCase()} · ready for configuration`;});
-  if(remaining.length)lines.push(`Notice: ${remaining.length} step(s) are disconnected or part of a cycle.`);
-  lines.push("Preview completed. No external services or live actions were executed.");
-  setTestResult(lines);
+  const roots=nodes.filter(node=>node.data.kind==="trigger"&&!incoming.has(node.id));
+  const invalidEdges=edges.filter(edge=>!nodes.some(n=>n.id===edge.source)||!nodes.some(n=>n.id===edge.target));
+  if(nodes.length===0||roots.length!==1||invalidEdges.length){
+   setTestResult([nodes.length===0?"Validation failed: add at least one step.":roots.length!==1?"Validation failed: the workflow must have exactly one unconnected trigger.":"Validation failed: a connection points to a missing step.","No execution was started."]);setRunBusy(false);return;
+  }
+  const visited=new Set<string>();const ordered:FlowNode[]=[];const queue=[roots[0].id];let cycle=false;let branchNote="";
+  while(queue.length){
+   const id=queue.shift()!;if(visited.has(id)){cycle=true;continue;}
+   const node=nodes.find(item=>item.id===id);if(!node)continue;
+   visited.add(id);ordered.push(node);
+   let next=edges.filter(edge=>edge.source===id);
+   if(node.data.kind==="condition"){
+    const yes=/equals\\s+new|customer\\.type.*new/i.test(node.data.config);
+    branchNote=`Condition evaluated with demo input (customer.type = new): ${yes?"YES":"NO"}.`;
+    next=next.filter(edge=>edge.sourceHandle===(yes?"yes":"no"));
+   }
+   next.forEach(edge=>{if(visited.has(edge.target))cycle=true;else queue.push(edge.target);});
+  }
+  const disconnected=nodes.filter(node=>!visited.has(node.id));
+  if(cycle||disconnected.length){
+   setTestResult([cycle?"Validation failed: a cycle was detected.":`Validation failed: ${disconnected.length} step(s) are disconnected from the trigger.`,"Connect all steps to a valid path, then run the test again.","No execution was started."]);setRunBusy(false);return;
+  }
+  const started=new Date().toISOString();
+  const {data:runData,error:runError}=await supabase.from("workflow_runs").insert({id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,status:"running",started_at:started,trigger_data:{customer:{type:"new",email:"demo@example.com"}},summary:"Safe simulation; no external services called."}).select("id").single();
+  if(runError){setTestResult([`Could not save execution: ${runError.message}`,"Run supabase/migrations/20261118_execution_engine_v1.sql in Supabase SQL Editor, then retry."]);setRunBusy(false);return;}
+  const lines=[`Execution ${runData.id.slice(0,8)} · RUNNING`];setTestResult(lines);
+  let failed=false;
+  for(let i=0;i<ordered.length;i++){
+   const node=ordered[i],stepId=crypto.randomUUID();
+   const {error:insertError}=await supabase.from("workflow_run_steps").insert({id:stepId,run_id:runId,workflow_id:String(builderFlow.id),user_id:session.user.id,node_id:node.id,node_name:node.data.label,node_type:node.data.kind,position:i+1,status:"running",input:{simulation:true},started_at:new Date().toISOString()});
+   if(insertError){failed=true;lines.push(`${i+1}. ${node.data.label} — FAILED: ${insertError.message}`);break;}
+   const {error:updateError}=await supabase.from("workflow_run_steps").update({status:"success",output:{simulation:true,message:"Step simulated; no external action performed."},finished_at:new Date().toISOString()}).eq("id",stepId);
+   if(updateError){failed=true;lines.push(`${i+1}. ${node.data.label} — FAILED: ${updateError.message}`);break;}
+   lines.push(`${i+1}. ${node.data.label} — SUCCESS · simulated`);setTestResult([...lines]);
+  }
+  if(branchNote)lines.push(branchNote);
+  await supabase.from("workflow_runs").update({status:failed?"failed":"success",finished_at:new Date().toISOString(),summary:failed?"Execution stopped because a step could not be saved.":"Simulation completed successfully."}).eq("id",runId);
+  lines.push(failed?"Execution failed. Check database permissions and run details.":"Execution completed successfully in safe simulation mode.");
+  lines.push("No email, webhook, or external service was called.");setTestResult(lines);setRunBusy(false);
  }
  const sidebar=<aside className="flex h-full w-64 shrink-0 flex-col border-r border-white/[.07] bg-[#0a101d]">
   <a href="/" className="flex h-[76px] items-center gap-3 border-b border-white/[.07] px-6"><span className="grid h-9 w-9 place-items-center rounded-xl border border-teal-300/20 bg-teal-300/10 text-teal-300"><Workflow size={20}/></span><span className="text-[15px] font-bold tracking-[.17em]">FLOWMATIC</span></a>
@@ -150,7 +183,7 @@ export default function App() {
   <main className="flex min-w-0 flex-1 flex-col">
    <header className="flex h-[76px] shrink-0 items-center justify-between border-b border-white/[.07] px-5 sm:px-8"><div className="flex items-center gap-3"><button onClick={()=>setMobileNav(true)} className="rounded-lg p-2 text-slate-400 lg:hidden" aria-label="Open navigation"><Menu size={20}/></button><div><div className="text-[11px] text-slate-500">Workspace / <span className="text-slate-300">{builderFlow?"Builder":activeNav}</span></div><div className="mt-0.5 text-sm font-semibold">{builderFlow?builderFlow.name:activeNav}</div></div></div><div className="flex items-center gap-2 sm:gap-4"><button className="hidden items-center gap-2 rounded-lg border border-white/[.08] bg-white/[.025] px-3 py-2 text-[11px] text-slate-500 sm:flex"><Command size={13}/> Search <kbd className="ml-3 rounded border border-white/10 px-1.5 py-0.5 text-[9px]">⌘ K</kbd></button><button className="relative rounded-lg p-2 text-slate-400" aria-label="Notifications"><Bell size={18}/><span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-teal-300"/></button><button onClick={()=>supabase?.auth.signOut()} className="rounded-lg border border-white/10 px-3 py-2 text-[10px] text-slate-400 hover:text-white">Sign out</button><span className="hidden sm:grid h-8 w-8 place-items-center rounded-full border border-white/10 bg-indigo-400/15 text-xs font-semibold text-indigo-200">{session.user.email?.slice(0,1).toUpperCase()??"U"}</span></div></header>
    {builderFlow?<section className="flex min-h-0 flex-1 flex-col">
-    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[.07] px-5 py-3 sm:px-7"><div className="flex items-center gap-3"><button onClick={()=>setBuilderFlow(null)} className="rounded-lg border border-white/10 p-2 text-slate-400" aria-label="Back to workflows"><ArrowLeft size={16}/></button><div><div className="text-xs font-semibold">{builderFlow.name}</div><div className="mt-1 text-[10px] text-slate-500">Visual editor · Draft</div></div></div><div className="flex items-center gap-2"><span className="hidden text-[10px] text-slate-500 sm:block">Cloud sync enabled</span><button onClick={saveDraft} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-[11px] text-slate-300"><Save size={14}/> Save draft</button><button onClick={runTest} className="inline-flex items-center gap-2 rounded-lg bg-teal-300 px-3 py-2 text-[11px] font-bold text-slate-950"><Play size={13}/> Test workflow</button></div></div>
+    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/[.07] px-5 py-3 sm:px-7"><div className="flex items-center gap-3"><button onClick={()=>setBuilderFlow(null)} className="rounded-lg border border-white/10 p-2 text-slate-400" aria-label="Back to workflows"><ArrowLeft size={16}/></button><div><div className="text-xs font-semibold">{builderFlow.name}</div><div className="mt-1 text-[10px] text-slate-500">Visual editor · Draft</div></div></div><div className="flex items-center gap-2"><span className="hidden text-[10px] text-slate-500 sm:block">Cloud sync enabled</span><button onClick={saveDraft} className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-[11px] text-slate-300"><Save size={14}/> Save draft</button><button onClick={runTest} disabled={runBusy} className="inline-flex items-center gap-2 rounded-lg bg-teal-300 px-3 py-2 text-[11px] font-bold text-slate-950 disabled:opacity-50"><Play size={13}/> {runBusy?"Running…":"Run test"}</button></div></div>
     {savedNotice&&<div className="border-b border-teal-300/15 bg-teal-300/[.06] px-6 py-2 text-[11px] text-teal-200">Workflow saved to your Supabase cloud workspace.</div>}
     {testResult.length>0&&<div className="border-b border-sky-300/15 bg-sky-300/[.045] px-5 py-3 sm:px-7"><div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-bold tracking-[.14em] text-sky-200">TEST PREVIEW</span><button onClick={()=>setTestResult([])} className="text-[10px] text-slate-500 hover:text-white">Clear</button></div><ol className="space-y-1.5">{testResult.map((line,index)=><li key={index} className="text-[10px] leading-5 text-slate-300">{line}</li>)}</ol></div>}
     <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
