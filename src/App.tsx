@@ -174,7 +174,22 @@ export default function App() {
   type PendingStep={id:string;input:Record<string,unknown>};
   const queue:PendingStep[]=[{id:roots[0].id,input:triggerData}];
   const executed=new Set<string>();
+  const queued=new Set<string>([roots[0].id]);
   const traversedEdgeIds=new Set<string>();
+  const resolvedEdgeIds=new Set<string>();
+  const activeIncoming=new Map<string,Edge[]>();
+  const edgeOutputs=new Map<string,Record<string,unknown>>();
+  const mergeData=(values:Record<string,unknown>[]):Record<string,unknown>=>{
+   const merge=(left:unknown,right:unknown):unknown=>{
+    if(left&&right&&typeof left==="object"&&typeof right==="object"&&!Array.isArray(left)&&!Array.isArray(right)){
+     const result={...(left as Record<string,unknown>)};
+     Object.entries(right as Record<string,unknown>).forEach(([key,value])=>{result[key]=key in result?merge(result[key],value):value;});
+     return result;
+    }
+    return right;
+   };
+   return values.reduce<Record<string,unknown>>((result,value)=>merge(result,value) as Record<string,unknown>,{});
+  };
   let failed=false;
   const getPath=(value:unknown,path:string):unknown=>path.split(".").reduce<unknown>((current,key)=>current&&typeof current==="object"&&key in current?(current as Record<string,unknown>)[key]:undefined,value);
   const evaluateCondition=(config:string,input:Record<string,unknown>)=>{
@@ -227,11 +242,40 @@ export default function App() {
    setRunNodeStates(current=>({...current,[node.id]:"success"}));
    lines.push(`${executed.size}. ${node.data.label} — SUCCESS · ${node.data.kind==="condition"?"evaluated":node.data.kind==="trigger"?"received input":"simulated"}${stepNote}`);
    setTestResult([...lines]);
-   nextEdges.forEach(edge=>{
-    traversedEdgeIds.add(edge.id);
-    if(!executed.has(edge.target)&&!queue.some(item=>item.id===edge.target))queue.push({id:edge.target,input:output});
+   const outgoing=adjacency.get(node.id)??[];
+   const activeIds=new Set(nextEdges.map(edge=>edge.id));
+   outgoing.forEach(edge=>{
+    resolvedEdgeIds.add(edge.id);
+    if(activeIds.has(edge.id)){
+     traversedEdgeIds.add(edge.id);
+     edgeOutputs.set(edge.id,output);
+     const incomingForTarget=activeIncoming.get(edge.target)??[];
+     incomingForTarget.push(edge);
+     activeIncoming.set(edge.target,incomingForTarget);
+    }
    });
-   setRunEdgeStates(current=>({...current,...Object.fromEntries(nextEdges.map(edge=>[edge.id,"active" as const]))}));
+   setRunEdgeStates(current=>({...current,...Object.fromEntries(outgoing.map(edge=>[edge.id,activeIds.has(edge.id)?"active" as const:"inactive" as const]))}));
+   let discovered=true;
+   while(discovered){
+    discovered=false;
+    for(const candidate of nodes){
+     if(candidate.id===roots[0].id||executed.has(candidate.id)||queued.has(candidate.id))continue;
+     const incomingEdges=edges.filter(edge=>edge.target===candidate.id);
+     if(!incomingEdges.length||!incomingEdges.every(edge=>resolvedEdgeIds.has(edge.id)))continue;
+     const activeEdges=activeIncoming.get(candidate.id)??[];
+     if(activeEdges.length){
+      const inputs=activeEdges.map(edge=>edgeOutputs.get(edge.id)??{});
+      queue.push({id:candidate.id,input:mergeData(inputs)});
+      queued.add(candidate.id);
+     }else{
+      (adjacency.get(candidate.id)??[]).forEach(edge=>{
+       resolvedEdgeIds.add(edge.id);
+       setRunEdgeStates(current=>({...current,[edge.id]:"inactive"}));
+      });
+     }
+     discovered=true;
+    }
+   }
   }
   const skippedNodes=failed?[]:nodes.filter(node=>reachable.has(node.id)&&!executed.has(node.id));
   for(let index=0;index<skippedNodes.length;index++){
