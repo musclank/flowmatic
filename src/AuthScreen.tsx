@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { FormEvent } from "react";
 import { isSupabaseConfigured, supabase } from "./lib/supabase";
 import { Workflow, ArrowUpRight, LockKeyhole, Mail } from "lucide-react";
 
@@ -10,7 +11,7 @@ export default function AuthScreen() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
-  async function submit(event: React.FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!supabase) return;
     setBusy(true); setError(""); setMessage("");
